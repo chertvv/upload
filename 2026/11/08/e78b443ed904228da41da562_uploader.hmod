@@ -1,0 +1,377 @@
+HOTARU = {
+    "id": "uploader", "name": "Uploader", "version": "2.0.1",
+    "commands": ["upload", "catbox", "litterbox", "x0", "tmpfiles", "pomf", "put", "ghupload"],
+    "capabilities": ["mt", "net"], "requires": [],
+    "config_schema": {
+        "github_token": {"type": "str", "default": "", "secret": True,
+                         "description": "GitHub personal access token. Never send it in a chat command."},
+        "litterbox_time": {"type": "str", "default": "24h",
+                           "description": "Litterbox retention: 1h, 12h, 24h or 72h."}
+    },
+    "lexicon": {
+        "en": {"description": "Upload replied files or text to a selected hosting service.",
+               "commands": {}},
+        "ru": {"description": "Загрузка файла или текста из ответа на выбранный хостинг.",
+               "commands": {}}
+    }
+}
+
+import base64
+import html
+import json
+import mimetypes
+import re
+import secrets
+import threading
+import time
+from urllib.parse import quote, urlsplit
+
+PORT_CONTRACT = {
+    "hotaru_commit": "8f24614f87fca01c0b8e15806009f50c899a7329",
+    "media_transport": "mt upload.getFile in memory; no assets/workspace patch required",
+    "max_bytes": 524288,
+    "tested": "offline unit tests only; no live Telegram or hosting uploads",
+    "privacy": "No fallback hosts; GitHub token is UI-masked, not claimed encrypted"
+}
+
+HOSTS = {
+    "catbox": ("https://catbox.moe/user/api.php", "fileToUpload", {"reqtype": "fileupload"}),
+    "litterbox": ("https://litterbox.catbox.moe/resources/internals/api.php", "fileToUpload", {"reqtype": "fileupload"}),
+    "x0": ("https://x0.at/", "file", {"id_length": "24"}),
+    "tmpfiles": ("https://tmpfiles.org/api/v1/upload", "file", {}),
+    "pomf": ("https://pomf.lain.la/upload.php", "files[]", {}),
+    "put": ("https://put.icu/upload/", None, {})
+}
+for _name in HOTARU["commands"]:
+    HOTARU["lexicon"]["en"]["commands"][_name] = {"description": "Reply to file/text; upload <host>, litterbox [1h/12h/24h/72h]"}
+    HOTARU["lexicon"]["ru"]["commands"][_name] = {"description": "Ответ на файл/текст; upload <хостинг>, litterbox [1h/12h/24h/72h]"}
+
+MAX_BYTES = 512 * 1024
+DOWNLOAD_CHUNK_BYTES = 64 * 1024
+_BUSY = set()
+_BUSY_LOCK = threading.Lock()
+
+
+def ru(ctx):
+    return str(ctx.i18n.language).lower().startswith("ru")
+
+
+def say(ctx, russian, english):
+    return russian if ru(ctx) else english
+
+
+class UploadError(Exception):
+    pass
+
+
+def filename(value):
+    value = str(value or "file.bin").replace("\\", "/").rsplit("/", 1)[-1]
+    value = re.sub(r"[^A-Za-z0-9._-]", "_", value).strip(".")[:160]
+    return value or "file.bin"
+
+
+def valid_url(value):
+    if not isinstance(value, str) or len(value) > 2048 or any(c.isspace() or ord(c) < 32 for c in value):
+        raise UploadError("Invalid URL in hosting response")
+    parsed = urlsplit(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise UploadError("Invalid URL in hosting response")
+    return value
+
+
+def multipart(field, name, data, fields):
+    boundary = "Hotaru" + secrets.token_hex(24)
+    chunks = []
+    for key, value in fields.items():
+        chunks.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n').encode())
+    mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    chunks.extend([(f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{name}"\r\nContent-Type: {mime}\r\n\r\n').encode(), data,
+                   f"\r\n--{boundary}--\r\n".encode()])
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def parse_host_response(host, body):
+    try:
+        if host == "pomf":
+            response = json.loads(body)
+            if response.get("success") is False:
+                raise UploadError("Pomf rejected the upload")
+            value = response["files"][0]["url"]
+        elif host == "tmpfiles":
+            response = json.loads(body)
+            if response.get("status") != "success":
+                raise UploadError("Tmpfiles rejected the upload")
+            value = response["data"]["url"]
+        elif host == "put":
+            value = json.loads(body)["url"]
+        else:
+            value = body.strip()
+        return valid_url(value)
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise UploadError("Unexpected hosting response") from exc
+
+
+async def request(ctx, url, method="GET", headers=None, body=None, payload=None):
+    options = {"method": method, "headers": headers or {}, "timeout": 180, "max_bytes": 256 * 1024}
+    if body is not None:
+        options["body"] = body
+    if payload is not None:
+        options["json"] = payload
+    response = await ctx.net(url, **options)
+    if not isinstance(response, dict) or response.get("truncated"):
+        raise UploadError(say(ctx, "Некорректный или обрезанный ответ хостинга.", "Invalid or truncated hosting response."))
+    return response
+
+
+async def host_upload(ctx, host, name, data, args):
+    endpoint, field, defaults = HOSTS[host]
+    fields = dict(defaults)
+    if host == "litterbox":
+        expiry = args[0] if args else str(ctx.config.get("litterbox_time", "24h"))
+        if expiry not in ("1h", "12h", "24h", "72h"):
+            raise UploadError("Litterbox: 1h / 12h / 24h / 72h")
+        fields["time"] = expiry
+    elif args:
+        raise UploadError("This command does not accept arguments")
+    if field:
+        body, content_type = multipart(field, name, data, fields)
+        headers = {"Content-Type": content_type}
+    else:
+        body = data
+        headers = {"Content-Type": "application/octet-stream", "Accept": "application/json", "Linx-Expiry": "86400"}
+    response = await request(ctx, endpoint, "POST" if field else "PUT", headers, body)
+    status = response.get("status", 0)
+    if not 200 <= status < 300:
+        raise UploadError(f"{host}: HTTP {status}")
+    return parse_host_response(host, response.get("body", "")), False
+
+
+async def github_api(ctx, token, path, method="GET", payload=None):
+    response = await request(ctx, "https://api.github.com" + path, method, {
+        "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "Hotaru-Uploader"
+    }, payload=payload)
+    status = response.get("status", 0)
+    try:
+        data = json.loads(response.get("body", ""))
+    except (ValueError, TypeError):
+        raise UploadError(f"GitHub: HTTP {status}, invalid JSON")
+    return status, data
+
+
+async def github_upload(ctx, name, data):
+    token = str(ctx.config.get("github_token", "")).strip()
+    if not token:
+        raise UploadError(say(ctx, "Задайте github_token в настройках модуля.", "Set github_token in module settings."))
+    status, account = await github_api(ctx, token, "/user")
+    if status != 200 or not isinstance(account, dict) or not account.get("login"):
+        raise UploadError(f"GitHub /user: HTTP {status}")
+    owner = quote(account["login"], safe="")
+    repo_path = f"/repos/{owner}/upload"
+    status, repository = await github_api(ctx, token, repo_path)
+    private = False
+    if status == 404:
+        status, repository = await github_api(ctx, token, "/user/repos", "POST", {
+            "name": "upload", "private": private, "auto_init": False,
+            "description": "Files uploaded with Hotaru", "has_issues": False,
+            "has_projects": False, "has_wiki": False
+        })
+        if status == 422:
+            status, repository = await github_api(ctx, token, repo_path)
+        if status not in (200, 201):
+            raise UploadError(f"GitHub: cannot create/access upload repository (HTTP {status})")
+    elif status != 200:
+        raise UploadError(f"GitHub repository: HTTP {status}")
+    if not isinstance(repository, dict) or repository.get("owner", {}).get("login", "").lower() != account["login"].lower():
+        raise UploadError("GitHub: unexpected repository owner")
+    if repository.get("private") is not False:
+        raise UploadError(say(ctx,
+            "Репозиторий upload должен быть публичным. Измените его видимость в GitHub вручную; файл не загружен.",
+            "The upload repository must be public. Change its visibility in GitHub manually; the file was not uploaded."))
+    path = time.strftime("%Y/%m/%d", time.gmtime()) + "/" + secrets.token_hex(12) + "_" + name
+    status, uploaded = await github_api(ctx, token, repo_path + "/contents/" + quote(path, safe="/"), "PUT", {
+        "message": "Upload " + name + "\n\nCo-Authored-By: Claude Code <noreply@anthropic.com>",
+        "content": base64.b64encode(data).decode("ascii")
+    })
+    if status != 201:
+        raise UploadError(f"GitHub file upload: HTTP {status}")
+    try:
+        url = valid_url(uploaded["content"]["html_url"])
+    except (KeyError, TypeError) as exc:
+        raise UploadError("GitHub: missing file link") from exc
+    return url, bool(repository.get("private"))
+
+
+def binary_value(value):
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str) and len(value) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]*", value):
+        return bytes.fromhex(value)
+    raise UploadError("Telegram returned invalid binary data")
+
+
+def media_location(ctx, media):
+    if not isinstance(media, dict):
+        raise UploadError(say(ctx, "Неподдерживаемое вложение.", "Unsupported attachment."))
+    document = media.get("document")
+    photo = media.get("photo")
+    if isinstance(document, dict) and document.get("_") != "documentEmpty":
+        item = document
+        kind = "inputDocumentFileLocation"
+        thumb = ""
+        size = document.get("size")
+        name = "file.bin"
+        for attribute in document.get("attributes", []):
+            if isinstance(attribute, dict) and attribute.get("_") == "documentAttributeFilename":
+                name = attribute.get("file_name") or name
+                break
+    elif isinstance(photo, dict) and photo.get("_") != "photoEmpty":
+        sizes = []
+        for entry in photo.get("sizes", []):
+            if not isinstance(entry, dict):
+                continue
+            tag = entry.get("_")
+            if tag == "photoSize":
+                size = entry.get("size")
+            elif tag == "photoSizeProgressive":
+                values = entry.get("sizes", [])
+                size = max(values) if isinstance(values, list) and values and all(type(value) is int and value >= 0 for value in values) else None
+            else:
+                continue
+            if type(size) is int and size >= 0 and isinstance(entry.get("type"), str) and entry["type"]:
+                sizes.append((size, entry["type"]))
+        if not sizes:
+            raise UploadError(say(ctx, "У фото нет доступного размера для скачивания.", "The photo has no downloadable size."))
+        size, thumb = max(sizes)
+        item = photo
+        kind = "inputPhotoFileLocation"
+        name = "photo.jpg"
+    else:
+        raise UploadError(say(ctx, "Это вложение не является файлом или фото.", "This attachment is not a file or photo."))
+    if type(size) is not int or size < 0:
+        raise UploadError(say(ctx, "Telegram не вернул размер вложения.", "Telegram did not return the attachment size."))
+    if size > MAX_BYTES:
+        raise UploadError("Hotaru worker limit: file exceeds 512 KiB")
+    if any(type(item.get(key)) is not int for key in ("id", "access_hash")):
+        raise UploadError("Telegram returned incomplete file metadata")
+    reference = binary_value(item.get("file_reference"))
+    return filename(name), size, {
+        "_": kind, "id": item["id"], "access_hash": item["access_hash"],
+        "file_reference": reference, "thumb_size": thumb
+    }
+
+
+async def download_bytes(ctx, location, size):
+    data = bytearray()
+    while len(data) < size:
+        try:
+            response = await ctx.tg.call("upload.getFile", {
+                "location": location, "offset": len(data), "limit": DOWNLOAD_CHUNK_BYTES
+            })
+        except PermissionError as exc:
+            raise UploadError(say(ctx,
+                "Нет разрешения mt для скачивания. Подтвердите Telegram API в разрешениях модуля.",
+                "Downloading requires mt permission. Approve Telegram API in module permissions.")) from exc
+        if not isinstance(response, dict) or response.get("_") != "upload.file":
+            raise UploadError(say(ctx, "Telegram не вернул содержимое файла.", "Telegram did not return file contents."))
+        chunk = binary_value(response.get("bytes"))
+        if not chunk or len(chunk) > DOWNLOAD_CHUNK_BYTES or len(data) + len(chunk) > size:
+            raise UploadError(say(ctx, "Telegram вернул неполный файл или неверный размер.", "Telegram returned an incomplete file or invalid size."))
+        data.extend(chunk)
+        if len(data) < size and len(chunk) != DOWNLOAD_CHUNK_BYTES:
+            raise UploadError(say(ctx, "Telegram вернул неполный файл.", "Telegram returned an incomplete file."))
+    return bytes(data)
+
+
+async def get_file(ctx, reply):
+    media = reply.get("media")
+    if not media or isinstance(media, dict) and media.get("_") in ("messageMediaEmpty", "messageMediaWebPage"):
+        content = reply.get("message") or reply.get("text") or ""
+        if not content:
+            raise UploadError(say(ctx, "В ответе нет файла или текста.", "The reply has no file or text."))
+        data = content.encode("utf-8")
+        if len(data) > MAX_BYTES:
+            raise UploadError("Hotaru worker limit: file exceeds 512 KiB")
+        return "text.txt", data
+    name, size, location = media_location(ctx, media)
+    try:
+        data = await download_bytes(ctx, location, size)
+    except Exception as exc:
+        error = str(exc).upper()
+        if "FILE_REFERENCE_" not in error or not any(marker in error for marker in ("EXPIRED", "EMPTY", "INVALID")):
+            raise
+        message_id = reply.get("id") or reply.get("message_id")
+        if type(message_id) is not int:
+            raise UploadError(say(ctx, "Ссылка на файл устарела. Повторите команду ответом на файл.", "The file reference expired. Run the command again as a reply to the file.")) from exc
+        refreshed = await ctx.msg(ctx.chat_id, message_id)
+        if not isinstance(refreshed, dict):
+            raise UploadError(say(ctx, "Исходный файл больше недоступен.", "The original file is no longer available.")) from exc
+        name, size, location = media_location(ctx, refreshed.get("media"))
+        if location["id"] != media_location(ctx, media)[2]["id"]:
+            raise UploadError(say(ctx, "Вложение изменилось. Повторите команду.", "The attachment changed. Run the command again.")) from exc
+        data = await download_bytes(ctx, location, size)
+    return name, data
+
+
+async def execute(ctx, host, args):
+    if host not in HOSTS and host != "github":
+        return await ctx.respond("<b>upload:</b> catbox, litterbox, x0, tmpfiles, pomf, put, github", parse_mode="HTML")
+    if host == "github" and args:
+        return await ctx.respond("<b>ghupload</b>: no arguments", parse_mode="HTML")
+    with _BUSY_LOCK:
+        if _BUSY:
+            acquired = False
+        else:
+            _BUSY.add("upload")
+            acquired = True
+    if not acquired:
+        return await ctx.respond(say(ctx, "⏳ Дождитесь завершения текущей загрузки.", "⏳ Wait for the current upload to finish."))
+    try:
+        reply = await ctx.reply()
+        if not reply:
+            raise UploadError(say(ctx, "Ответьте на файл или текст.", "Reply to a file or text."))
+        await ctx.respond(say(ctx, "⚡ Загружаю…", "⚡ Uploading…"))
+        name, data = await get_file(ctx, reply)
+        url, private = await github_upload(ctx, name, data) if host == "github" else await host_upload(ctx, host, name, data, args)
+        note = say(ctx, "\n🔒 Приватный репозиторий: нужен доступ к GitHub.", "\n🔒 Private repository: GitHub access is required.") if private else ""
+        await ctx.respond(say(ctx, "✅ <b>Файл загружен!</b>", "✅ <b>File uploaded!</b>") + "\n<code>" + html.escape(url) + "</code>" + note, parse_mode="HTML")
+    except UploadError as exc:
+        await ctx.respond("❌ " + html.escape(str(exc)), parse_mode="HTML")
+    except Exception:
+        await ctx.respond(say(ctx, "❌ Ошибка скачивания или HTTP-запроса. Проверьте доступность сервиса и разрешения модуля; автоматического повтора нет.", "❌ Download or HTTP request failed. Check service availability and module permissions; no automatic retry was performed."))
+    finally:
+        with _BUSY_LOCK:
+            _BUSY.discard("upload")
+
+
+async def command_upload(ctx, invocation):
+    args = invocation.raw_args.split()
+    await execute(ctx, args[0].lower() if args else "", args[1:])
+
+
+async def command_catbox(ctx, invocation):
+    await execute(ctx, "catbox", invocation.raw_args.split())
+
+
+async def command_litterbox(ctx, invocation):
+    await execute(ctx, "litterbox", invocation.raw_args.split())
+
+
+async def command_x0(ctx, invocation):
+    await execute(ctx, "x0", invocation.raw_args.split())
+
+
+async def command_tmpfiles(ctx, invocation):
+    await execute(ctx, "tmpfiles", invocation.raw_args.split())
+
+
+async def command_pomf(ctx, invocation):
+    await execute(ctx, "pomf", invocation.raw_args.split())
+
+
+async def command_put(ctx, invocation):
+    await execute(ctx, "put", invocation.raw_args.split())
+
+
+async def command_ghupload(ctx, invocation):
+    await execute(ctx, "github", invocation.raw_args.split())
